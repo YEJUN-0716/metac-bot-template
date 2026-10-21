@@ -174,3 +174,6 @@ cython_debug/
 
 # Local scratch/temp scripts
 temp/
+
+# Shadow-forecast rows of the current run (pushed to the forecast-log branch by CI)
+forecast_log.jsonl

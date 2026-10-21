@@ -41,6 +41,7 @@ from forecasting_tools import (
     structure_output,
 )
 
+import json
 import os
 import time
 
@@ -105,14 +106,22 @@ class CappedLlm(GeneralLlm):
         )
 
 
-def budget_llms() -> dict[str, str | GeneralLlm]:
-    # allowed_tries=5: the library retries failed calls (e.g. 429) with random
-    # exponential backoff of 5-60 s between attempts.
-    cheap = CappedLlm(model=CHEAP_MODEL, temperature=0.3, timeout=120, allowed_tries=5)
-    has_asknews = bool(
+def has_asknews_keys() -> bool:
+    return bool(
         (os.getenv("ASKNEWS_CLIENT_ID") and os.getenv("ASKNEWS_SECRET"))
         or os.getenv("ASKNEWS_API_KEY")
     )
+
+
+def budget_llms(research: str = "auto") -> dict[str, str | GeneralLlm]:
+    """research: "auto" (AskNews if its keys are set, else none), "asknews" or "none"."""
+    # allowed_tries=5: the library retries failed calls (e.g. 429) with random
+    # exponential backoff of 5-60 s between attempts.
+    cheap = CappedLlm(model=CHEAP_MODEL, temperature=0.3, timeout=120, allowed_tries=5)
+    if research == "auto":
+        research = "asknews" if has_asknews_keys() else "none"
+    if research not in ("asknews", "none"):
+        raise ValueError(f"research must be auto, asknews or none, not {research!r}")
     return {
         "default": cheap,
         "summarizer": cheap,
@@ -120,7 +129,76 @@ def budget_llms() -> dict[str, str | GeneralLlm]:
         # AskNews is free for registered bots. Without its keys, skip research
         # instead of falling back to a paid search model (the library default
         # would be openrouter/openai/gpt-4o-search-preview).
-        "researcher": "asknews/news-summaries" if has_asknews else "no_research",
+        "researcher": "asknews/news-summaries" if research == "asknews" else "no_research",
+    }
+
+
+# ---- Shadow forecasts (see docs: scoring pre-registration) ----
+# Each tournament/MiniBench question is forecast twice in the same run, at the same
+# time: the main arm (submitted) and a shadow arm (never submitted, only logged).
+# SHADOW_RESEARCH picks the shadow arm's research:
+#   "same"  -> identical to the main arm (A/A, measures noise and correlation). Default.
+#   "none"  -> no research. Use this once AskNews keys exist (main = AskNews, shadow = none).
+#   "asknews" -> AskNews. "off" -> no shadow arm.
+SHADOW_RESEARCH = os.getenv("SHADOW_RESEARCH", "same")
+FORECAST_LOG_PATH = os.getenv("FORECAST_LOG_PATH", "forecast_log.jsonl")
+PREDICTIONS_PER_QUESTION = 3  # template default 5; 3 keeps a median at ~60% of the cost
+
+
+def arm_config_name(llms: dict[str, str | GeneralLlm], predictions: int) -> str:
+    model = GeneralLlm.to_model_name(llms["default"]).removeprefix("openrouter/")
+    return f"{model}|{predictions}x|research={GeneralLlm.to_model_name(llms['researcher'])}"
+
+
+def prediction_to_json(prediction: object, question: MetaculusQuestion) -> object:
+    """The forecast as submitted: binary -> P(yes); multiple choice -> {option: p};
+    numeric/date -> {"cdf": [...]} on Metaculus's grid (same conversion as publishing)."""
+    if isinstance(prediction, (int, float)):
+        return float(prediction)
+    if isinstance(prediction, PredictedOptionList):
+        return {o.option_name: o.probability for o in prediction.predicted_options}
+    if isinstance(prediction, NumericDistribution):
+        if prediction.cdf_size is None:
+            prediction = NumericDistribution.from_question(
+                prediction.declared_percentiles, question  # type: ignore[arg-type]
+            )
+        return {"cdf": [p.percentile for p in prediction.get_cdf()]}
+    if hasattr(prediction, "model_dump"):
+        return prediction.model_dump(mode="json")  # type: ignore[attr-defined]
+    return str(prediction)
+
+
+def _safe_prediction_json(prediction: object, question: MetaculusQuestion) -> object:
+    try:
+        return prediction_to_json(prediction, question)
+    except Exception as e:  # one odd prediction must not lose the whole row
+        return {"unserializable": f"{type(e).__name__}: {e}"[:300]}
+
+
+def forecast_log_row(question: MetaculusQuestion, arms: list[dict]) -> dict:
+    bounds = {
+        k: getattr(question, k)
+        for k in (
+            "lower_bound",
+            "upper_bound",
+            "open_lower_bound",
+            "open_upper_bound",
+            "zero_point",
+            "cdf_size",
+        )
+        if hasattr(question, k)
+    }
+    return {
+        "schema": 1,
+        "time_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "run_id": os.getenv("GITHUB_RUN_ID"),
+        "post_id": question.id_of_post,
+        "question_id": question.id_of_question,
+        "url": question.page_url,
+        "type": type(question).__name__,
+        "options": getattr(question, "options", None),
+        "bounds": json.loads(json.dumps(bounds, default=str)),
+        "arms": arms,
     }
 
 
@@ -204,6 +282,58 @@ class FallTemplateBot2026(ForecastBot):
     )
     _concurrency_limiter = asyncio.Semaphore(_max_concurrent_questions)
     _structure_output_validation_samples = 2
+
+    # Shadow forecasting (set in __main__). A bot with a shadow_bot forecasts each
+    # question with both, concurrently, and appends one row per question to the log.
+    shadow_bot: "FallTemplateBot2026 | None" = None
+    arm_config: str = ""
+
+    async def _aggregate_predictions(self, predictions, question):
+        # Keep the individual predictions so the log can store them too.
+        if not hasattr(self, "_individual_predictions"):
+            self._individual_predictions = {}
+        self._individual_predictions[question.id_of_question] = list(predictions)
+        return await super()._aggregate_predictions(predictions, question)
+
+    def _arm_record(self, question: MetaculusQuestion, result, role: str) -> dict:
+        ok = not isinstance(result, BaseException)
+        individual = getattr(self, "_individual_predictions", {}).pop(
+            question.id_of_question, []
+        )
+        return {
+            "role": role,
+            "config": self.arm_config,
+            "published": ok and self.publish_reports_to_metaculus,
+            "ok": ok,
+            "error": None if ok else f"{type(result).__name__}: {result}"[:300],
+            "final": _safe_prediction_json(result.prediction, question) if ok else None,
+            "individual": [_safe_prediction_json(p, question) for p in individual],
+            "cost_usd": result.price_estimate if ok else None,
+        }
+
+    async def _run_individual_question(self, question: MetaculusQuestion):
+        if self.shadow_bot is None:
+            return await super()._run_individual_question(question)
+        main_result, shadow_result = await asyncio.gather(
+            super()._run_individual_question(question),
+            self.shadow_bot._run_individual_question(question),
+            return_exceptions=True,
+        )
+        try:
+            row = forecast_log_row(
+                question,
+                [
+                    self._arm_record(question, main_result, "main"),
+                    self.shadow_bot._arm_record(question, shadow_result, "shadow"),
+                ],
+            )
+            with open(FORECAST_LOG_PATH, "a", encoding="utf-8") as f:
+                f.write(json.dumps(row, ensure_ascii=False) + "\n")
+        except Exception as e:  # logging must never block a submitted forecast
+            logger.error(f"Could not write forecast log for {question.page_url}: {e}")
+        if isinstance(main_result, BaseException):
+            raise main_result
+        return main_result
 
     ##################################### RESEARCH #####################################
 
@@ -354,6 +484,7 @@ class FallTemplateBot2026(ForecastBot):
             Background:
             {question.background_info}
 
+            This question's outcome will be determined by the specific criteria below. These criteria have not yet been satisfied:
             {question.resolution_criteria}
 
             {question.fine_print}
@@ -431,6 +562,7 @@ class FallTemplateBot2026(ForecastBot):
             Background:
             {question.background_info}
 
+            This question's outcome will be determined by the specific criteria below. These criteria have not yet been satisfied:
             {question.resolution_criteria}
 
             {question.fine_print}
@@ -527,6 +659,7 @@ class FallTemplateBot2026(ForecastBot):
             Background:
             {question.background_info}
 
+            This question's outcome will be determined by the specific criteria below. These criteria have not yet been satisfied:
             {question.resolution_criteria}
 
             {question.fine_print}
@@ -787,16 +920,28 @@ if __name__ == "__main__":
 
     # Configure the bot. Models and research are pinned in budget_llms() above
     # so the $5 OpenRouter balance lasts the season (see README "Budget mode").
-    template_bot = FallTemplateBot2026(
-        research_reports_per_question=1,
-        predictions_per_research_report=3,  # template default 5; 3 keeps a median at ~60% of the cost
-        use_research_summary_to_forecast=False,
-        publish_reports_to_metaculus=publish_to_metaculus,
-        folder_to_save_reports_to=None,
-        skip_previously_forecasted_questions=True,
-        extra_metadata_in_explanation=True,
-        llms=budget_llms(),
-    )
+    def make_bot(research: str, publish: bool) -> FallTemplateBot2026:
+        llms = budget_llms(research)
+        bot = FallTemplateBot2026(
+            research_reports_per_question=1,
+            predictions_per_research_report=PREDICTIONS_PER_QUESTION,
+            use_research_summary_to_forecast=False,
+            publish_reports_to_metaculus=publish,
+            folder_to_save_reports_to=None,
+            skip_previously_forecasted_questions=True,
+            extra_metadata_in_explanation=True,
+            llms=llms,
+        )
+        bot.arm_config = arm_config_name(llms, PREDICTIONS_PER_QUESTION)
+        return bot
+
+    template_bot = make_bot("auto", publish_to_metaculus)
+    # Shadow arm only on scored questions (not test/cup runs). Never published.
+    if run_mode in ("minibench", "tournament") and SHADOW_RESEARCH != "off":
+        template_bot.shadow_bot = make_bot(
+            "auto" if SHADOW_RESEARCH == "same" else SHADOW_RESEARCH, publish=False
+        )
+        print(f"Shadow arm: {template_bot.shadow_bot.arm_config} (main: {template_bot.arm_config})")
 
     # Per-mode tournament URL shown in the summary banner footer. These
     # piggyback on the forecasting_tools SDK constants and need updating
