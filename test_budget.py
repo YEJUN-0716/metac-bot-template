@@ -2,6 +2,7 @@
 litellm's mock_response fakes the LLM reply. Run: python test_budget.py"""
 import asyncio
 import os
+import time
 
 for k in ("ASKNEWS_CLIENT_ID", "ASKNEWS_SECRET", "ASKNEWS_API_KEY"):
     os.environ.pop(k, None)
@@ -43,7 +44,21 @@ def test_cost_is_tracked_and_cap_stops_calls() -> None:
     assert spent > 0, "cost tracker read $0, so the per-run cap would never trigger"
 
 
+def test_requests_are_spaced_under_the_rate_limit() -> None:
+    main.MAX_REQUESTS_PER_MINUTE = 600  # 0.1 s apart, so the test stays fast
+    llm = main.CappedLlm(model=main.CHEAP_MODEL, mock_response="ok")
+
+    async def run() -> float:
+        start = time.monotonic()
+        await asyncio.gather(*(llm.invoke("hi") for _ in range(5)))  # like 3 predictions + parsing at once
+        return time.monotonic() - start
+
+    elapsed = asyncio.run(run())
+    assert elapsed >= 0.4 - 0.02, f"5 concurrent calls took {elapsed:.2f}s; expected >= 0.4s at 600/min"
+
+
 if __name__ == "__main__":
     test_no_paid_research_without_asknews()
     test_cost_is_tracked_and_cap_stops_calls()
+    test_requests_are_spaced_under_the_rate_limit()
     print("ok")
