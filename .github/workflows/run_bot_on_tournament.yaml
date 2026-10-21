@@ -15,6 +15,8 @@ concurrency:
 jobs:
   forecast_job:
     runs-on: ubuntu-latest # determines the machine that will run the job - keep as is
+    permissions:
+      contents: write # only to push the shadow-forecast log to the forecast-log branch
     steps: # sets up the steps that will be run in order
       # setup repository with all necessary dependencies - keep as is
       - name: Check out repository
@@ -52,3 +54,25 @@ jobs:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           ASKNEWS_CLIENT_ID: ${{ secrets.ASKNEWS_CLIENT_ID }}
           ASKNEWS_SECRET: ${{ secrets.ASKNEWS_SECRET }}
+          # Shadow arm (logged, never submitted). "same" = A/A test. Once AskNews keys
+          # are set, change to "none" so main = AskNews, shadow = no research.
+          SHADOW_RESEARCH: same
+      # Runners are wiped after each job, so append this run's rows to a JSONL file on
+      # a separate branch. Only question ids, forecasts, configs and costs; no secrets.
+      - name: Save forecast log to the forecast-log branch
+        if: always()
+        run: |
+          [ -s forecast_log.jsonl ] || { echo "No new forecast rows"; exit 0; }
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          if git fetch --depth=1 origin forecast-log; then
+            git worktree add -B forecast-log ../log FETCH_HEAD
+          else
+            git worktree add --orphan -b forecast-log ../log
+          fi
+          mkdir -p ../log/logs
+          cat forecast_log.jsonl >> ../log/logs/forecasts.jsonl
+          cd ../log
+          git add logs/forecasts.jsonl
+          git commit -m "Forecast log: run ${{ github.run_id }}"
+          git push origin forecast-log
