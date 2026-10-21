@@ -1,4 +1,4 @@
-name: Forecast on new AI tournament questions
+name: Forecast on new MiniBench questions (budget mode)
 
 on:
   workflow_dispatch:
@@ -39,7 +39,8 @@ jobs:
         run: poetry install --no-interaction --no-root
       - name: Run bot
         run: |
-          poetry run python main.py
+          # Budget mode: MiniBench only. Use `python main.py` (tournament mode) to add the main tournament back.
+          poetry run python main.py --mode minibench
         # this reads the environment variables from the github repository.
         # Store under Settings --> Secrets and variables --> Actions
         env:

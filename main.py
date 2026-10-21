@@ -41,8 +41,65 @@ from forecasting_tools import (
     structure_output,
 )
 
+import os
+
+import litellm
+from forecasting_tools.ai_models.resource_managers.monetary_cost_manager import (
+    MonetaryCostManager,
+)
+
 dotenv.load_dotenv()
 logger = logging.getLogger(__name__)
+
+# ---- Budget settings ($5 OpenRouter balance for the rest of the fall 2026 season) ----
+# One cheap model for every role. Price from https://openrouter.ai/api/v1/models
+# (checked 2026-10-21): $0.10 / 1M input tokens, $0.50 / 1M output tokens.
+CHEAP_MODEL = "openrouter/openai/gpt-6-luna"
+CHEAP_MODEL_PRICE_PER_TOKEN = (0.10e-6, 0.50e-6)  # (input, output) in USD
+# Stop calling the LLM once one run has spent this much (USD). Questions left
+# unforecast are retried on the next run because already-forecast ones are skipped.
+MAX_COST_PER_RUN_USD = float(os.getenv("MAX_COST_PER_RUN_USD", "0.5"))
+
+# litellm's price list does not know this model, so without this the cost
+# tracker would read $0 and the per-run cap above would never trigger.
+litellm.register_model(
+    {
+        CHEAP_MODEL: {
+            "input_cost_per_token": CHEAP_MODEL_PRICE_PER_TOKEN[0],
+            "output_cost_per_token": CHEAP_MODEL_PRICE_PER_TOKEN[1],
+            "litellm_provider": "openrouter",
+            "mode": "chat",
+        }
+    }
+)
+
+
+class CappedLlm(GeneralLlm):
+    """GeneralLlm that refuses to call once an active MonetaryCostManager is spent.
+    The library only checks the cap inside a litellm callback, which does not stop the call."""
+
+    async def _invoke_with_request_cost_time_and_token_limits_and_retry(self, *args, **kwargs):
+        MonetaryCostManager.raise_error_if_limit_would_be_reached()
+        return await super()._invoke_with_request_cost_time_and_token_limits_and_retry(
+            *args, **kwargs
+        )
+
+
+def budget_llms() -> dict[str, str | GeneralLlm]:
+    cheap = CappedLlm(model=CHEAP_MODEL, temperature=0.3, timeout=120, allowed_tries=2)
+    has_asknews = bool(
+        (os.getenv("ASKNEWS_CLIENT_ID") and os.getenv("ASKNEWS_SECRET"))
+        or os.getenv("ASKNEWS_API_KEY")
+    )
+    return {
+        "default": cheap,
+        "summarizer": cheap,
+        "parser": cheap,
+        # AskNews is free for registered bots. Without its keys, skip research
+        # instead of falling back to a paid search model (the library default
+        # would be openrouter/openai/gpt-4o-search-preview).
+        "researcher": "asknews/news-summaries" if has_asknews else "no_research",
+    }
 
 
 class FallTemplateBot2026(ForecastBot):
@@ -693,39 +750,30 @@ if __name__ == "__main__":
     parser.add_argument(
         "--mode",
         type=str,
-        choices=["tournament", "metaculus_cup", "test_questions"],
+        choices=["tournament", "minibench", "metaculus_cup", "test_questions"],
         default="tournament",
         help="What to forecast on (default: tournament)",
     )
     args = parser.parse_args()
-    run_mode: Literal["tournament", "metaculus_cup", "test_questions"] = args.mode
+    run_mode: Literal["tournament", "minibench", "metaculus_cup", "test_questions"] = (
+        args.mode
+    )
 
     check_environment(strict=True)
     publish_to_metaculus = True
     print_startup_banner(run_mode, will_publish=publish_to_metaculus)
 
-    # Configure the bot. The `llms=` block below is commented out to use
-    # whichever default models forecasting-tools picks based on your env vars;
-    # uncomment and edit to pin specific models.
+    # Configure the bot. Models and research are pinned in budget_llms() above
+    # so the $5 OpenRouter balance lasts the season (see README "Budget mode").
     template_bot = FallTemplateBot2026(
         research_reports_per_question=1,
-        predictions_per_research_report=5,
+        predictions_per_research_report=3,  # template default 5; 3 keeps a median at ~60% of the cost
         use_research_summary_to_forecast=False,
         publish_reports_to_metaculus=publish_to_metaculus,
         folder_to_save_reports_to=None,
         skip_previously_forecasted_questions=True,
         extra_metadata_in_explanation=True,
-        # llms={
-        #     "default": GeneralLlm(
-        #         model="openrouter/openai/gpt-4o",
-        #         temperature=0.3,
-        #         timeout=40,
-        #         allowed_tries=2,
-        #     ),
-        #     "summarizer": "openai/gpt-4o-mini",
-        #     "researcher": "asknews/news-summaries",
-        #     "parser": "openai/gpt-4o-mini",
-        # },
+        llms=budget_llms(),
     )
 
     # Per-mode tournament URL shown in the summary banner footer. These
@@ -741,7 +789,18 @@ if __name__ == "__main__":
     # exceptions, since return_exceptions=True) which then flows into the
     # summary printers below.
     client = MetaculusClient()
-    if run_mode == "tournament":
+    # Per-run spending cap. Entered for the whole process (no exit needed); once
+    # spent, further LLM calls raise HardLimitExceededError and those questions
+    # are reported as failed, not posted.
+    run_cost = MonetaryCostManager(MAX_COST_PER_RUN_USD).__enter__()
+    if run_mode == "minibench":
+        # Budget mode: MiniBench only (see README "Budget mode").
+        forecast_reports = asyncio.run(
+            template_bot.forecast_on_tournament(
+                client.CURRENT_MINIBENCH_ID, return_exceptions=True
+            )
+        )
+    elif run_mode == "tournament":
         seasonal_tournament_reports = asyncio.run(
             template_bot.forecast_on_tournament(
                 client.CURRENT_AI_COMPETITION_ID, return_exceptions=True
@@ -776,6 +835,7 @@ if __name__ == "__main__":
         )
 
     template_bot.log_report_summary(forecast_reports)
+    print(f"Run LLM cost: ${run_cost.current_usage:.4f} (cap ${MAX_COST_PER_RUN_USD})")
     print_run_summary_banner(
         forecast_reports,
         will_publish=publish_to_metaculus,

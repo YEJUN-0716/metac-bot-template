@@ -12,6 +12,24 @@ In this project are 2 files:
 
 Join the conversation about bot creation, get support, and follow updates on the [Metaculus Discord](https://discord.com/invite/NJgCC2nDfh) 'build a forecasting bot' channel.
 
+## Budget mode (this fork)
+Set up to last the rest of the fall 2026 season on a **$5 OpenRouter balance**.
+- **Model:** `openrouter/openai/gpt-6-luna` for forecasting, summarizing and parsing ($0.10 / 1M input, $0.50 / 1M output, [OpenRouter models API](https://openrouter.ai/api/v1/models), checked 2026-10-21).
+- **Research:** AskNews (free for registered bots) when `ASKNEWS_CLIENT_ID` + `ASKNEWS_SECRET` are set; otherwise no research. No paid search is ever used.
+- **Predictions per question:** 3 (template default 5); the median of the 3 is submitted.
+- **What runs:** MiniBench only, every 20 min (`main.py --mode minibench`). The Metaculus Cup schedule is removed.
+- **Cap:** each run stops calling the LLM after `MAX_COST_PER_RUN_USD` (default $0.5). Unforecast questions are retried next run.
+
+Estimate (rough, not measured): ~$0.005 per prediction (≈6k input + 3.5k output tokens for the forecast, plus 2 parsing calls), so ~$0.015 per question.
+
+| Setup | Questions left (~Oct 21 – mid Dec) | Est. cost |
+|---|---|---|
+| 5 predictions, main tournament + MiniBench | ~190 + ~240 | ~$10.8 |
+| 3 predictions, main tournament + MiniBench | ~190 + ~240 | ~$6.5 |
+| **3 predictions, MiniBench only (chosen)** | ~240 | **~$3.6** |
+
+Main tournament count assumes 300–400 questions per season spread evenly over ~15 weeks; MiniBench is ~60 questions per 2-week round. To add the main tournament back once there is more budget, change `--mode minibench` to nothing in `.github/workflows/run_bot_on_tournament.yaml`. Offline check: `python test_budget.py`.
+
 ## 30min Video Tutorial
 This tutorial shows you how to set up our template bot so you can start forecasting in the tournament.
 
