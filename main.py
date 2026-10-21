@@ -42,6 +42,7 @@ from forecasting_tools import (
 )
 
 import os
+import time
 
 import litellm
 from forecasting_tools.ai_models.resource_managers.monetary_cost_manager import (
@@ -59,6 +60,20 @@ CHEAP_MODEL_PRICE_PER_TOKEN = (0.10e-6, 0.50e-6)  # (input, output) in USD
 # Stop calling the LLM once one run has spent this much (USD). Questions left
 # unforecast are retried on the next run because already-forecast ones are skipped.
 MAX_COST_PER_RUN_USD = float(os.getenv("MAX_COST_PER_RUN_USD", "0.5"))
+# New OpenRouter accounts get 20 requests/min per model; stay under it for the
+# whole process (all questions, predictions and parsing calls share this).
+MAX_REQUESTS_PER_MINUTE = float(os.getenv("MAX_REQUESTS_PER_MINUTE", "15"))
+_next_request_slot = 0.0
+
+
+async def wait_for_request_slot() -> None:
+    """Space LLM requests 60/MAX_REQUESTS_PER_MINUTE seconds apart, process-wide.
+    The slot is reserved before the first await, so concurrent callers never share one."""
+    global _next_request_slot
+    now = time.monotonic()
+    slot = max(now, _next_request_slot)
+    _next_request_slot = slot + 60 / MAX_REQUESTS_PER_MINUTE
+    await asyncio.sleep(slot - now)
 
 # litellm's price list does not know this model, so without this the cost
 # tracker would read $0 and the per-run cap above would never trigger.
@@ -75,8 +90,13 @@ litellm.register_model(
 
 
 class CappedLlm(GeneralLlm):
-    """GeneralLlm that refuses to call once an active MonetaryCostManager is spent.
-    The library only checks the cap inside a litellm callback, which does not stop the call."""
+    """GeneralLlm that refuses to call once an active MonetaryCostManager is spent
+    (the library only checks the cap inside a litellm callback, which does not stop
+    the call) and that waits for a rate-limit slot before every HTTP attempt."""
+
+    async def _call_litellm(self, *args, **kwargs):
+        await wait_for_request_slot()
+        return await super()._call_litellm(*args, **kwargs)
 
     async def _invoke_with_request_cost_time_and_token_limits_and_retry(self, *args, **kwargs):
         MonetaryCostManager.raise_error_if_limit_would_be_reached()
@@ -86,7 +106,9 @@ class CappedLlm(GeneralLlm):
 
 
 def budget_llms() -> dict[str, str | GeneralLlm]:
-    cheap = CappedLlm(model=CHEAP_MODEL, temperature=0.3, timeout=120, allowed_tries=2)
+    # allowed_tries=5: the library retries failed calls (e.g. 429) with random
+    # exponential backoff of 5-60 s between attempts.
+    cheap = CappedLlm(model=CHEAP_MODEL, temperature=0.3, timeout=120, allowed_tries=5)
     has_asknews = bool(
         (os.getenv("ASKNEWS_CLIENT_ID") and os.getenv("ASKNEWS_SECRET"))
         or os.getenv("ASKNEWS_API_KEY")

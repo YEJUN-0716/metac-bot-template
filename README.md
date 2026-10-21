@@ -19,6 +19,7 @@ Set up to last the rest of the fall 2026 season on a **$5 OpenRouter balance**.
 - **Predictions per question:** 3 (template default 5); the median of the 3 is submitted.
 - **What runs:** MiniBench only, every 20 min (`main.py --mode minibench`). The Metaculus Cup schedule is removed.
 - **Cap:** each run stops calling the LLM after `MAX_COST_PER_RUN_USD` (default $0.5). Unforecast questions are retried next run.
+- **Rate limit:** at most `MAX_REQUESTS_PER_MINUTE` (default 15) LLM requests per minute across the whole run, because new OpenRouter accounts get 20/min per model. Failed calls (e.g. 429) are retried up to 5 times with 5–60 s backoff.
 
 Estimate (rough, not measured): ~$0.005 per prediction (≈6k input + 3.5k output tokens for the forecast, plus 2 parsing calls), so ~$0.015 per question.
 
