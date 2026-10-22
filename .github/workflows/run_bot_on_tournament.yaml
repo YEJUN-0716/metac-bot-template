@@ -56,7 +56,7 @@ jobs:
           ASKNEWS_SECRET: ${{ secrets.ASKNEWS_SECRET }}
           # Shadow arm (logged, never submitted). "same" = A/A test. Once AskNews keys
           # are set, change to "none" so main = AskNews, shadow = no research.
-          SHADOW_RESEARCH: same
+          SHADOW_RESEARCH: none
       # Runners are wiped after each job, so append this run's rows to a JSONL file on
       # a separate branch. Only question ids, forecasts, configs and costs; no secrets.
       - name: Save forecast log to the forecast-log branch
