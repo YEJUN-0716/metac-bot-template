@@ -352,9 +352,15 @@ class FallTemplateBot2026(ForecastBot):
                 or researcher == "asknews/deep-research/medium-depth"
                 or researcher == "asknews/deep-research/high-depth"
             ):
-                research = await AskNewsSearcher().call_preconfigured_version(
-                    researcher, prompt
-                )
+                # 보너스 지갑이 바닥나는 등 AskNews가 거절해도 예측은 뉴스 없이 계속한다.
+                # ponytail: 이 경우 주 팔도 사실상 뉴스 없음이라 그 질문의 짝비교는 무의미 — 로그로 가려낸다.
+                try:
+                    research = await AskNewsSearcher().call_preconfigured_version(
+                        researcher, prompt
+                    )
+                except Exception as e:
+                    logger.warning(f"ASKNEWS_FAILED {question.page_url}: {e!r} — 뉴스 없이 진행")
+                    research = ""
             elif researcher.startswith("smart-searcher"):
                 model_name = researcher.removeprefix("smart-searcher/")
                 searcher = SmartSearcher(
